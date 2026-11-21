@@ -1,150 +1,95 @@
-//! Precursor Scientific Calculator
+//! Scientific calculator for Precursor: algebraic and HP-style RPN modes.
 //!
-//! A TI-85 competitor with algebraic and RPN modes, scientific functions,
-//! memory registers, and persistent settings.
+//! All calculator logic lives in `calc-core` (host-tested). This crate
+//! registers with GAM, routes messages, persists, and draws.
 
-#![cfg_attr(target_os = "none", no_std)]
-#![cfg_attr(target_os = "none", no_main)]
-
-extern crate alloc;
-
-mod algebraic;
 mod app;
-mod display;
-mod functions;
-mod keymap;
-mod memory;
-mod rpn;
-mod storage;
 mod ui;
 
-use app::CalcApp;
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
+use precursor_appkit::{app as kit, keys, store};
 
-// Server name for xous names registration (underscored)
+/// xous-names server name. Any unique string; NOT the GAM app name.
 const SERVER_NAME: &str = "_Calc Scientific_";
-// App name for GAM registration (must match manifest context_name)
-const APP_NAME: &str = "Calculator";
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
-enum CalcOp {
+pub(crate) enum AppOp {
     Redraw = 0,
     Rawkeys,
     FocusChange,
+    BasisChanged,
     Quit,
 }
 
 fn main() -> ! {
-    // Initialize logging
     log_server::init_wait().unwrap();
     log::set_max_level(log::LevelFilter::Info);
-    log::info!("Calculator starting, PID {}", xous::process::id());
+    log::info!("calc PID is {}", xous::process::id());
 
-    // Connect to name server and register
     let xns = xous_names::XousNames::new().unwrap();
-    let sid = xns
-        .register_name(SERVER_NAME, None)
-        .expect("can't register server");
+    let sid = xns.register_name(SERVER_NAME, None).expect("can't register server");
 
-    // Connect to GAM for graphics
-    let gam = gam::Gam::new(&xns).expect("can't connect to GAM");
+    // GAM app name comes from apps/manifest.json key "calc".
+    let reg = kit::register(
+        &xns,
+        sid,
+        gam::APP_NAME_CALC,
+        gam::UxType::Framebuffer,
+        kit::Opcodes {
+            redraw: AppOp::Redraw.to_u32().unwrap(),
+            rawkeys: Some(AppOp::Rawkeys.to_u32().unwrap()),
+            focus_change: Some(AppOp::FocusChange.to_u32().unwrap()),
+            got_input: None,
+        },
+    );
 
-    // Register UX with GAM
-    let token = gam
-        .register_ux(gam::UxRegistration {
-            app_name: String::from(APP_NAME),
-            ux_type: gam::UxType::Chat,
-            predictor: None,
-            listener: sid.to_array(),
-            redraw_id: CalcOp::Redraw.to_u32().unwrap(),
-            gotinput_id: None,
-            audioframe_id: None,
-            rawkeys_id: Some(CalcOp::Rawkeys.to_u32().unwrap()),
-            focuschange_id: Some(CalcOp::FocusChange.to_u32().unwrap()),
-        })
-        .expect("couldn't register UX")
-        .unwrap();
+    let store = store::Store::open(app::DICT);
+    store::watch_bases(xous::connect(sid).unwrap(), AppOp::BasisChanged.to_usize().unwrap());
 
-    // Get drawing canvas
-    let content = gam.request_content_canvas(token).expect("couldn't get canvas");
-    let screensize = gam.get_canvas_bounds(content).expect("couldn't get dimensions");
-    log::info!("Canvas size: {:?}", screensize);
+    let mut app = app::App::new(reg.screen, store);
+    let mut foreground = true;
 
-    // Initialize calculator app
-    let mut calc = CalcApp::new();
-    let mut allow_redraw = true;
-
-    // Initial draw
-    calc.draw(&gam, content);
-
-    // Main event loop
     loop {
         let msg = xous::receive_message(sid).unwrap();
         match FromPrimitive::from_usize(msg.body.id()) {
-            Some(CalcOp::Redraw) => {
-                if allow_redraw {
-                    calc.draw(&gam, content);
+            Some(AppOp::Redraw) => {
+                if foreground {
+                    app.draw();
                 }
             }
-            Some(CalcOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
-                let keys = [
-                    core::char::from_u32(k1 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k2 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k3 as u32).unwrap_or('\u{0000}'),
-                    core::char::from_u32(k4 as u32).unwrap_or('\u{0000}'),
-                ];
-
-                let mut needs_redraw = false;
-                let mut should_quit = false;
-
-                for &key in keys.iter() {
-                    if key != '\u{0000}' {
-                        log::debug!("Key: {:?} (0x{:04X})", key, key as u32);
-
-                        // Handle the key - let keymap decide actions including quit
-                        if !calc.handle_key(key) {
-                            // handle_key returns false for Quit action
-                            should_quit = true;
-                            break;
-                        }
-                        needs_redraw = true;
+            Some(AppOp::Rawkeys) => xous::msg_scalar_unpack!(msg, k1, k2, k3, k4, {
+                for key in keys::decode_rawkeys([k1, k2, k3, k4]) {
+                    if app.on_key(key) == calc_core::Action::Leave {
+                        app.save();
+                        kit::leave(app.screen());
                     }
                 }
-
-                if should_quit {
-                    break;
-                }
-
-                if needs_redraw && allow_redraw {
-                    calc.draw(&gam, content);
+                if foreground {
+                    app.draw();
                 }
             }),
-            Some(CalcOp::FocusChange) => xous::msg_scalar_unpack!(msg, state_code, _, _, _, {
-                match gam::FocusState::convert_focus_change(state_code) {
-                    gam::FocusState::Background => {
-                        allow_redraw = false;
-                        // Save state when going to background
-                        calc.save_state();
-                    }
+            Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, code, _, _, _, {
+                match kit::focus_state(code) {
                     gam::FocusState::Foreground => {
-                        allow_redraw = true;
-                        calc.draw(&gam, content);
+                        foreground = true;
+                        app.on_foreground();
+                    }
+                    gam::FocusState::Background => {
+                        foreground = false;
+                        app.save();
                     }
                 }
             }),
-            Some(CalcOp::Quit) => break,
-            _ => log::warn!("unknown opcode: {:?}", msg.body.id()),
+            Some(AppOp::BasisChanged) => {
+                app.reload();
+                if foreground {
+                    app.draw();
+                }
+            }
+            Some(AppOp::Quit) => break,
+            None => log::warn!("unknown opcode {:?}", msg.body.id()),
         }
     }
-
-    // Save state before exit
-    calc.save_state();
-
-    // Cleanup
-    xns.unregister_server(sid).unwrap();
-    xous::destroy_server(sid).unwrap();
-    xous::terminate_process(0)
+    app.save();
+    kit::shutdown(&xns, sid)
 }
-
-// Use num_traits for to_u32
-use num_traits::ToPrimitive;
