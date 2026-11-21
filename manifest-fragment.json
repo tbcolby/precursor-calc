@@ -1,0 +1,11 @@
+{
+    "calc": {
+        "context_name": "Calculator",
+        "menu_name": {
+            "appmenu.calc": {
+                "en": "Calculator",
+                "en-tts": "Calculator"
+            }
+        }
+    }
+}
