@@ -1,0 +1,16 @@
+[package]
+name = "calc-core"
+version = "0.2.0"
+edition = "2021"
+description = "Pure logic for the Precursor calculator: functions, infix parser, HP-style RPN stack, number formatting and the key-driven controller. No Xous dependencies."
+license = "Apache-2.0"
+
+# Keep this crate free of xous/gam/pddb so `cargo test` runs on any machine.
+[dependencies]
+# Pure appkit parts (keys). Git so `cargo test` works in this repo;
+# bin/integrate patches it to the in-tree copy.
+precursor-appkit-core = { git = "https://github.com/tbcolby/xous-dev-toolkit" }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+serde_json = "1.0"
